@@ -5,9 +5,7 @@ import Fuse from "fuse.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
-/**
- * Utility: Levenshtein distance -> similarity [0..1]
- */
+// --- same helpers from before ---
 function levenshteinDistance(a, b) {
   if (!a.length) return b.length;
   if (!b.length) return a.length;
@@ -35,44 +33,47 @@ function similarity(a, b) {
   return 1 - ld / maxLen;
 }
 
-/**
- * Normalization pipeline for Devanagari text
- * - NFC normalization
- * - keep only Devanagari unicode range + common punctuation/spaces
- * - collapse multiple identical characters (common garbling)
- * - remove control & invisible chars
- * - basic mapping for some frequent garble patterns (expandable)
- */
 function normalizeHindi(str) {
   if (!str || typeof str !== "string") return "";
   let s = str.normalize("NFC");
-
-  // remove invisible/control characters
   s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
-
-  // keep Devanagari block (0900–097F) and whitespace and basic punctuation
   s = s.replace(/[^\u0900-\u097F\s।॥\-–—]/g, " ");
-
-  // collapse multiple spaces
   s = s.replace(/\s+/g, " ").trim();
-
-  // collapse repeated identical consonants/vowel signs that appear from garbage,
-  // e.g., "ममम" -> "म", but be careful to not over-collapse legitimate doubling.
-  s = s.replace(/(.)\1{2,}/g, "$1$1"); // keep up to two if repeated many times
-
-  // small mapping fixes for frequent corruptions (you can expand this map)
-  const fixes = [
-    // these are examples — expand if you see more garbled outputs
-    ["पममबरई", "प्रेमबाई"],
-    ["पममबरै", "प्रेमबाई"],
-    ["पममबई", "प्रेमबाई"],
-    ["जयररम", "जयराम"],
-  ];
-  for (const [bad, good] of fixes) {
-    if (s.includes(bad)) s = s.split(bad).join(good);
-  }
-
+  s = s.replace(/(.)\1{2,}/g, "$1$1");
   return s;
+}
+
+// --- mapping persistence helpers ---
+const MAPPINGS_KEY = "pdfHindiMappings_v1";
+
+function loadMappings() {
+  try {
+    const raw = localStorage.getItem(MAPPINGS_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+function saveMappings(mapObj) {
+  try {
+    localStorage.setItem(MAPPINGS_KEY, JSON.stringify(mapObj));
+  } catch {}
+}
+
+// Replace occurrences in text by mapping preferences (map garbled -> correct)
+function applyMappingsToText(text, mappings) {
+  if (!mappings || Object.keys(mappings).length === 0) return text;
+  // We try to replace longer keys first to avoid partial overlap
+  const keys = Object.keys(mappings).sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const k of keys) {
+    if (!k) continue;
+    const safe = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(safe, "g");
+    out = out.replace(re, mappings[k]);
+  }
+  return out;
 }
 
 export default function App() {
@@ -80,7 +81,27 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
+  const [mappings, setMappings] = useState(loadMappings());
+  const [teachInput, setTeachInput] = useState(""); // user-provided correct text for teach action
   const fuseRef = useRef(null);
+
+  // Rebuild index whenever rows or mappings change
+  const buildIndex = (rows, currentMappings) => {
+    // Apply mapping to original text to produce textMapped (for display/search)
+    const rowsWithMapped = rows.map((r) => {
+      const mapped = applyMappingsToText(r.text, currentMappings);
+      return { ...r, textMapped: mapped, textNormMapped: normalizeHindi(mapped) };
+    });
+    // Build Fuse on textNormMapped
+    fuseRef.current = new Fuse(rowsWithMapped, {
+      keys: ["textNormMapped"],
+      includeScore: true,
+      threshold: 0.45,
+      distance: 100,
+      ignoreLocation: true,
+    });
+    setPdfRows(rowsWithMapped);
+  };
 
   async function extractTextFromPDF(arrayBuffer) {
     setLoading(true);
@@ -92,28 +113,15 @@ export default function App() {
         const content = await page.getTextContent();
         const strings = content.items.map((it) => it.str);
         const pageText = strings.join(" ");
-        // split heuristics: many PDFs lose newlines; try splitting on heavy spaces or punctuation
         const lines =
           pageText.split(/\r\n|\n|  |।|॥/).map((l) => l.trim()).filter(Boolean) || [
             pageText.trim(),
           ];
         lines.forEach((ln) => {
-          const textNorm = normalizeHindi(ln);
-          rows.push({ page: p, text: ln, textNorm });
+          rows.push({ page: p, text: ln, textNorm: normalizeHindi(ln) });
         });
       }
-
-      setPdfRows(rows);
-
-      // Build Fuse index on normalized text
-      fuseRef.current = new Fuse(rows, {
-        keys: ["textNorm"],
-        includeScore: true,
-        threshold: 0.45, // tweak: lower -> stricter, higher -> looser
-        distance: 100,
-        ignoreLocation: true,
-      });
-
+      buildIndex(rows, mappings);
       setResults([]);
     } catch (err) {
       console.error("PDF parsing error:", err);
@@ -130,42 +138,51 @@ export default function App() {
     await extractTextFromPDF(buffer);
   };
 
-  // Search logic: try exact -> normalized exact -> fuse fuzzy -> levenshtein fallback
+  // When mappings change, persist and rebuild index
   useEffect(() => {
-    if (!query || pdfRows.length === 0) {
+    saveMappings(mappings);
+    // rebuild index using existing original rows (we have original in pdfRows as text)
+    // gather original rows (if pdfRows has textMapped version, get original text backup)
+    const originalRows = pdfRows.length
+      ? pdfRows.map((r) => ({ page: r.page, text: r.text || r.textMapped || "" }))
+      : [];
+    if (originalRows.length) buildIndex(originalRows, mappings);
+  }, [mappings]);
+
+  // Search pipeline as before but using mapped text
+  useEffect(() => {
+    if (!query || !fuseRef.current) {
       setResults([]);
       return;
     }
     const qRaw = query.trim();
     const q = normalizeHindi(qRaw);
-    // 1) exact fast search on raw text (helps if pdf has exact)
-    const exact = pdfRows.filter((r) => r.text.includes(qRaw));
+
+    // 1) exact on mapped raw text (fast)
+    const exact = pdfRows.filter((r) => (r.textMapped || r.text).includes(qRaw));
     if (exact.length) {
       setResults(exact);
       return;
     }
-    // 2) exact on normalized text
-    const exactNorm = pdfRows.filter((r) => r.textNorm.includes(q));
+    // 2) exact on normalized mapped text
+    const exactNorm = pdfRows.filter((r) => (r.textNormMapped || r.textNorm).includes(q));
     if (exactNorm.length) {
       setResults(exactNorm);
       return;
     }
-    // 3) fuse fuzzy search on normalized text
-    if (fuseRef.current) {
-      const fuseRes = fuseRef.current.search(q);
-      if (fuseRes && fuseRes.length) {
-        // filter by reasonable score (lower score = better; includeScore true)
-        const good = fuseRes.filter((r) => (r.score ?? 1) <= 0.55); // tweakable
-        if (good.length) {
-          setResults(good.map((g) => g.item));
-          return;
-        }
+    // 3) Fuse fuzzy
+    const fuseRes = fuseRef.current.search(q);
+    if (fuseRes && fuseRes.length) {
+      const good = fuseRes.filter((r) => (r.score ?? 1) <= 0.55);
+      if (good.length) {
+        setResults(good.map((g) => g.item));
+        return;
       }
     }
-    // 4) Levenshtein similarity fallback across normalized text
+    // 4) Levenshtein fallback on mapped normalized
     const levMatches = pdfRows
-      .map((r) => ({ r, sim: similarity(r.textNorm, q) }))
-      .filter((o) => o.sim >= 0.62) // tweak threshold; 0.62 is forgiving
+      .map((r) => ({ r, sim: similarity(r.textNormMapped || r.textNorm, q) }))
+      .filter((o) => o.sim >= 0.62)
       .sort((a, b) => b.sim - a.sim)
       .map((o) => o.r);
     if (levMatches.length) {
@@ -173,60 +190,183 @@ export default function App() {
       return;
     }
 
-    // nothing found
     setResults([]);
   }, [query, pdfRows]);
 
+  // Teach mapping: map a garbled snippet -> correct user-provided text
+  function teachMapping(garbled, correct) {
+    if (!garbled || !correct) return;
+    const newMap = { ...mappings };
+    newMap[garbled] = correct;
+    setMappings(newMap);
+    // Rebuild index will be triggered by effect on mappings
+  }
+
+  // Auto-suggest: given user-pasted correct text, try to find a best candidate garbled row and offer mapping
+  function suggestMappingForPaste(correctText) {
+    if (!correctText || pdfRows.length === 0) return null;
+    const q = normalizeHindi(correctText);
+    // search top candidates in fuse (they are garbled but normalized)
+    if (!fuseRef.current) return null;
+    const cand = fuseRef.current.search(q, { limit: 8 });
+    if (!cand || cand.length === 0) return null;
+    // pick top item textMapped as suggested garble
+    const top = cand[0].item;
+    // If exact similarity good, propose mapping
+    const sim = similarity(top.textNormMapped || top.textNorm, q);
+    return { garbled: top.text, mapped: correctText, sim, page: top.page };
+  }
+
+  // UI helper: remove a mapping
+  function removeMapping(garbled) {
+    if (!mappings[garbled]) return;
+    const copy = { ...mappings };
+    delete copy[garbled];
+    setMappings(copy);
+  }
+
   return (
-    <div className="min-h-screen p-6 bg-slate-50">
-      <div className="max-w-4xl mx-auto bg-white p-6 rounded-2xl shadow">
-        <h1 className="text-2xl font-semibold mb-4">PDF Hindi Search — Robust</h1>
+    <div className="min-h-screen bg-slate-50">
+      <div className="max-w-5xl mx-auto bg-white p-6 rounded-2xl shadow">
+        <h1 className="text-2xl font-semibold mb-4">PDF Hindi Search — Teach Mappings</h1>
 
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Upload PDF (Hindi)
-            </label>
-            <input type="file" accept="application/pdf" onChange={handleFile} className="bg-green-600 rounded-xl text-white w-48 p-3" />
+            <label className="block text-sm font-medium text-slate-700 mb-1">Upload PDF (Hindi)</label>
+            <input type="file" accept="application/pdf" onChange={handleFile} className=" bg-green-600 p-2 rounded-xl text-white" />
             <div className="text-xs text-slate-400 mt-1">
-              Use the local PDF (no CDN workers). Extraction may vary by PDF.
+              If text looks garbled in results, teach mappings once and future searches become accurate.
             </div>
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Search Hindi Name
-            </label>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Search Hindi Name</label>
             <input
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Type name like प्रेमबाई or जयराम"
+              placeholder="Type name like प्रेमबाई or मांगीलाल"
               className="w-full rounded-md border px-3 py-2"
             />
           </div>
 
-          <div className="flex items-center justify-between text-sm text-slate-600">
-            <span>Rows indexed: {pdfRows.length}</span>
-            {loading && <span className="text-blue-500">Extracting...</span>}
+          <div className="flex items-center gap-4">
+            <div className="text-sm text-slate-600">Rows indexed: {pdfRows.length}</div>
+            {loading && <div className="text-blue-500">Extracting...</div>}
+            <div className="ml-auto text-xs text-slate-500">Mappings saved to localStorage</div>
           </div>
 
-          <div>
-            <h2 className="text-lg font-medium mb-2">Results ({results.length})</h2>
-            <div className="space-y-2 max-h-96 overflow-auto">
-              {!loading && results.length === 0 && (
-                <div className="text-sm text-slate-400">No matches</div>
-              )}
-              {results.map((m, i) => (
-                <div key={i} className="p-3 border rounded-lg flex items-center gap-5 bg-slate-50 leading-relaxed">
-                  <div className="text-sm font-semibold text-slate-500 mb-1">Page {m.page}</div>
-                  <div className="text-sm">{query}</div>
-                </div>
-              ))}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <h2 className="text-lg font-medium mb-2">Results ({results.length})</h2>
+              <div className="space-y-2 max-h-96 overflow-auto">
+                {results.length === 0 && !loading && <div className="text-sm text-slate-400">No matches</div>}
+                {results.map((m, i) => (
+                  <div key={i} className="p-3 border rounded-lg bg-slate-50">
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs text-slate-500">Page {m.page}</div>
+                      <div className="text-xs text-slate-500">Norm: {m.textNormMapped || m.textNorm}</div>
+                    </div>
+                    <div className="mt-2 text-sm leading-relaxed">{highlightMappedText(m.textMapped || m.text, query)}</div>
+                    
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <h2 className="text-lg font-medium mb-2">Mappings ({Object.keys(mappings).length})</h2>
+              <div className="space-y-2 max-h-96 overflow-auto">
+                {Object.keys(mappings).length === 0 && <div className="text-sm text-slate-400">No mappings yet</div>}
+                {Object.entries(mappings).map(([g, c]) => (
+                  <div key={g} className="p-3 border rounded-lg bg-slate-50 flex items-start justify-between">
+                    <div>
+                      <div className="text-xs text-slate-500">Garbled</div>
+                      <div className="font-medium">{g}</div>
+                      <div className="text-xs text-slate-500 mt-1">Mapped → {c}</div>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <button onClick={() => {
+                        // quick search mapped value
+                        setQuery(c);
+                      }} className="text-sm px-2 py-1 border rounded">Search mapped</button>
+                      <button onClick={() => removeMapping(g)} className="text-sm px-2 py-1 border rounded">Remove</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="mt-4">
+                <h3 className="text-sm font-medium mb-2">Auto-suggest mapping</h3>
+                <p className="text-xs text-slate-500 mb-2">Paste the correct name and click Suggest — it'll find a top garbled candidate.</p>
+                <AutoSuggestBox pdfRows={pdfRows} onAccept={(garbled, correct) => {
+                  teachMapping(garbled, correct);
+                }} />
+              </div>
             </div>
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+// tiny component to help auto-suggest mapping
+function AutoSuggestBox({ pdfRows, onAccept }) {
+  const [input, setInput] = useState("");
+  const [suggest, setSuggest] = useState(null);
+
+  useEffect(() => {
+    if (!input || pdfRows.length === 0) {
+      setSuggest(null);
+      return;
+    }
+    const q = normalizeHindi(input);
+    // naive local search for candidate by similarity on textNorm
+    const ranked = pdfRows
+      .map((r) => ({ r, sim: similarity(r.textNorm || r.text, q) }))
+      .sort((a, b) => b.sim - a.sim)
+      .slice(0, 6);
+    if (ranked.length > 0 && ranked[0].sim > 0.35) {
+      setSuggest({ garbled: ranked[0].r.text, mapped: input, sim: ranked[0].sim, page: ranked[0].r.page });
+    } else {
+      setSuggest(null);
+    }
+  }, [input, pdfRows]);
+
+  return (
+    <div className="space-y-2">
+      <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="Paste correct text (e.g., मांगीलाल)" className="w-full rounded-md border px-3 py-2 text-sm" />
+      {suggest ? (
+        <div className="p-3 border rounded bg-slate-50">
+          <div className="text-xs text-slate-500">Suggested mapping (sim: {suggest.sim.toFixed(2)})</div>
+          <div className="font-medium mt-1">{suggest.garbled} → {suggest.mapped}</div>
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => onAccept(suggest.garbled, suggest.mapped)} className="px-3 py-1 bg-green-600 text-white rounded text-sm">Accept</button>
+          </div>
+        </div>
+      ) : (
+        <div className="text-xs text-slate-400">No suggestion yet — try a different paste or extract the garbled row from results and use Teach.</div>
+      )}
+    </div>
+  );
+}
+
+// Highlight mapped text (simple)
+function highlightMappedText(text, qRaw) {
+  if (!qRaw) return <span>{text}</span>;
+  try {
+    const q = qRaw.trim();
+    const idx = text.indexOf(q);
+    if (idx !== -1) {
+      return (
+        <>
+          {text.slice(0, idx)}
+          <mark className="bg-yellow-200 rounded px-0.5">{text.slice(idx, idx + q.length)}</mark>
+          {text.slice(idx + q.length)}
+        </>
+      );
+    }
+  } catch {}
+  return <span>{text}</span>;
 }
